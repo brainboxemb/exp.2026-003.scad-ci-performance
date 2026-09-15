@@ -25,7 +25,11 @@ jobs:
 
       - name: Report toolchain
         shell: bash
-        run: scad-toolchain-info
+        run: |
+          set -euo pipefail
+          scad-toolchain-info
+          dpkg-query -W -f='openscad-nightly-package=${Version}\n' openscad-nightly
+          sha256sum "$(command -v openscad-nightly)"
 
       - name: Run common benchmark workload
         shell: bash
