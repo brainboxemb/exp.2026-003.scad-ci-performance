@@ -10,6 +10,7 @@ ready_file="$bundle_root/READY"
 rootfs="$bundle_root/rootfs"
 python_lib="$bundle_root/python"
 wrapper="$bundle_root/openscad-exact"
+library_dirs_file="$bundle_root/library-dirs.txt"
 
 mkdir -p "$bundle_root"
 
@@ -32,29 +33,43 @@ if [[ ! -f "$ready_file" ]]; then
         | tar -h -cf - -T -
     ' | tar -xf - -C "$rootfs"
 
-    # The exact binary is dynamically linked. Cache the shared-library closure
-    # used by the binary plus the Qt offscreen/image plugins needed by CLI PNG
-    # rendering. Host libraries remain fallback; cached copies take precedence
-    # only inside the wrapper created below.
+    # Build a recursive shared-library closure for the exact OpenSCAD binary and
+    # the Qt plugins used by headless PNG rendering. A one-level ldd scan misses
+    # dependencies such as pulseaudio/libpulsecommon, so traverse dependencies
+    # until no new library paths are discovered.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
-      targets=(/usr/bin/openscad-nightly)
+      declare -A seen=()
+      queue=(/usr/bin/openscad-nightly)
       for dir in \
         /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms \
         /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats; do
         if [[ -d "$dir" ]]; then
-          while IFS= read -r plugin; do targets+=("$plugin"); done < <(find "$dir" \( -type f -o -type l \) -name "*.so*")
+          while IFS= read -r plugin; do queue+=("$plugin"); done < <(find "$dir" \( -type f -o -type l \) -name "*.so*")
         fi
       done
-      {
-        printf "%s\n" "${targets[@]}"
-        for target in "${targets[@]}"; do
+
+      paths_file="$(mktemp)"
+      while (( ${#queue[@]} > 0 )); do
+        target="${queue[0]}"
+        queue=("${queue[@]:1}")
+        [[ -e "$target" ]] || continue
+        [[ -n "${seen[$target]+x}" ]] && continue
+        seen["$target"]=1
+        printf "%s\n" "$target" >> "$paths_file"
+
+        while IFS= read -r dep; do
+          [[ -e "$dep" ]] || continue
+          [[ -n "${seen[$dep]+x}" ]] || queue+=("$dep")
+        done < <(
           ldd "$target" 2>/dev/null \
-            | awk '\''/=> \/[^ ]+/ {print $3} /^\// {print $1}'\''
-        done
-      } | sort -u | while IFS= read -r path; do
-        [[ -e "$path" ]] && printf "%s\n" "$path"
-      done | tar -h -cf - -T -
+            | awk '\''/=> \/[^ ]+/ {print $3} /^\// {print $1}'\'' \
+            | sort -u
+        )
+      done
+
+      sort -u "$paths_file" | tar -h -cf - -T -
+      rm -f "$paths_file"
     ' | tar -xf - -C "$rootfs"
 
     python3 -m pip install \
@@ -71,19 +86,21 @@ if [[ ! -f "$ready_file" ]]; then
       exit 1
     fi
 
+    (
+      cd "$rootfs"
+      find . -type f -name '*.so*' -printf '%h\n' | sort -u
+    ) > "$library_dirs_file"
+
     cat > "$wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 bundle_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rootfs="$bundle_dir/rootfs"
 lib_paths=()
-for candidate in \
-  "$rootfs/usr/lib/x86_64-linux-gnu" \
-  "$rootfs/lib/x86_64-linux-gnu" \
-  "$rootfs/usr/lib" \
-  "$rootfs/lib"; do
-  [[ -d "$candidate" ]] && lib_paths+=("$candidate")
-done
+while IFS= read -r relative_dir; do
+  relative_dir="${relative_dir#./}"
+  [[ -n "$relative_dir" ]] && lib_paths+=("$rootfs/$relative_dir")
+done < "$bundle_dir/library-dirs.txt"
 if (( ${#lib_paths[@]} > 0 )); then
   joined_libs="$(IFS=:; echo "${lib_paths[*]}")"
   export LD_LIBRARY_PATH="$joined_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -107,6 +124,7 @@ fi
 openscad_bin="$rootfs/usr/bin/openscad-nightly"
 test -x "$openscad_bin"
 test -x "$wrapper"
+test -s "$library_dirs_file"
 actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
 [[ "$actual_sha" == "$expected_binary_sha" ]]
 
