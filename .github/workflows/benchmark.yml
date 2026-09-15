@@ -1,0 +1,180 @@
+name: SCAD CI execution benchmark
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: scad-ci-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  SCAD_IMAGE: ghcr.io/brainboxemb/scad-toolchain:v0.4.1
+
+jobs:
+  job-container:
+    name: A - job container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/brainboxemb/scad-toolchain:v0.4.1
+
+    steps:
+      - name: Checkout benchmark fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Report toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          scad-toolchain-info
+          dpkg-query -W -f='openscad-nightly-package=${Version}\n' openscad-nightly
+          sha256sum "$(command -v openscad-nightly)"
+
+      - name: Run common benchmark workload
+        shell: bash
+        run: bash scripts/run-benchmark.sh job-container
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scad-ci-benchmark-job-container
+          path: out/job-container
+          if-no-files-found: error
+          retention-days: 14
+
+  cached-host:
+    name: B - cached host OpenSCAD
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout benchmark fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Start setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Restore exact OpenSCAD snapshot on host
+        uses: brainboxemb/brainboxemb.github.actions/actions/openscad-setup@0c73a5251d10956305aed48306c877e5aca25f1c
+        with:
+          openscad_version: "2026.09.09"
+
+      - name: Stop setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Run common benchmark workload
+        shell: bash
+        run: bash scripts/run-benchmark.sh cached-host
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scad-ci-benchmark-cached-host
+          path: out/cached-host
+          if-no-files-found: error
+          retention-days: 14
+
+  host-docker-run:
+    name: C - host plus docker run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout benchmark fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Start setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Pull exact SCAD toolchain image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$SCAD_IMAGE"
+
+      - name: Stop setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Run common benchmark workload in explicit container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e GITHUB_SHA="$GITHUB_SHA" \
+            -e RUNNER_OS="$RUNNER_OS" \
+            -e RUNNER_ARCH="$RUNNER_ARCH" \
+            -e BENCH_SETUP_START_NS="$BENCH_SETUP_START_NS" \
+            -e BENCH_SETUP_END_NS="$BENCH_SETUP_END_NS" \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            "$SCAD_IMAGE" \
+            bash scripts/run-benchmark.sh host-docker-run
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scad-ci-benchmark-host-docker-run
+          path: out/host-docker-run
+          if-no-files-found: error
+          retention-days: 14
+
+  exact-cached-host:
+    name: D - exact cached host package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout benchmark fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Start setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Restore exact host bundle cache
+        id: exact-host-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .cache/exact-host-toolchain
+          key: scad-exact-host-v6-ubuntu24-x64-image-v0.4.1-pillow12.3.0
+
+      - name: Authenticate registry for cold bundle build
+        if: steps.exact-host-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Prepare exact host bundle
+        shell: bash
+        run: bash scripts/setup-optimized-host.sh .cache/exact-host-toolchain
+
+      - name: Stop setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Run common benchmark workload
+        shell: bash
+        run: bash scripts/run-benchmark.sh exact-cached-host
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scad-ci-benchmark-exact-cached-host
+          path: out/exact-cached-host
+          if-no-files-found: error
+          retention-days: 14
