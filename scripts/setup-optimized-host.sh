@@ -21,9 +21,6 @@ if [[ ! -f "$ready_file" ]]; then
 
     docker pull "$image"
 
-    # Copy only the openscad-nightly package payload. Avoid archiving directory
-    # entries from dpkg -L because that would recursively pull unrelated files.
-    # Stdout from the container is a tar stream and must contain no diagnostics.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       dpkg-query -L openscad-nightly \
@@ -33,8 +30,6 @@ if [[ ! -f "$ready_file" ]]; then
         | tar -h -cf - -T -
     ' | tar -xf - -C "$rootfs"
 
-    # Build a recursive shared-library closure for the exact OpenSCAD binary and
-    # Qt plugins used by headless rendering.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       declare -A seen=()
@@ -70,8 +65,6 @@ if [[ ! -f "$ready_file" ]]; then
       rm -f "$paths_file"
     ' | tar -xf - -C "$rootfs"
 
-    # EGL/Mesa loads drivers and vendor metadata dynamically, so ldd cannot see
-    # them. Carry the exact image resources needed by the offscreen renderer.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       paths_file="$(mktemp)"
@@ -128,14 +121,13 @@ dri="$rootfs/usr/lib/x86_64-linux-gnu/dri"
 egl_vendor="$rootfs/usr/share/glvnd/egl_vendor.d/50_mesa.json"
 [[ -f "$egl_vendor" ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="$egl_vendor"
 
-# Use the same ELF loader as the immutable image as well as the same library
-# closure. This prevents the host runner's loader/runtime from becoming another
-# uncontrolled benchmark variable.
-loader="$rootfs/lib64/ld-linux-x86-64.so.2"
-if [[ ! -x "$loader" ]]; then
-  loader="$rootfs/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+loader="$(find "$rootfs" \( -type f -o -type l \) -name 'ld-linux-x86-64.so.2' -print -quit)"
+if [[ -z "$loader" || ! -x "$loader" ]]; then
+  echo "ERROR: exact image ELF loader not found in cached bundle." >&2
+  find "$rootfs" -maxdepth 4 -name 'ld-linux*' -ls >&2 || true
+  exit 1
 fi
-test -x "$loader"
+
 exec "$loader" --library-path "$joined_libs" "$rootfs/usr/bin/openscad-nightly" "$@"
 EOF
     chmod +x "$wrapper"
@@ -156,8 +148,6 @@ test -s "$library_dirs_file"
 actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
 [[ "$actual_sha" == "$expected_binary_sha" ]]
 
-# Keep the image-derived loader/library closure scoped to the OpenSCAD wrapper.
-# Only the exact cached Pillow is exposed to the host Python watermark process.
 export PYTHONPATH="$python_lib${PYTHONPATH:+:$PYTHONPATH}"
 
 "$wrapper" --version
