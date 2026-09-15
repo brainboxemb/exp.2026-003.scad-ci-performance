@@ -21,9 +21,9 @@ if [[ ! -f "$ready_file" ]]; then
 
     # Copy only the openscad-nightly package payload. Avoid archiving directory
     # entries from dpkg -L because that would recursively pull unrelated files.
+    # Stdout from the container is a tar stream and must contain no diagnostics.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
-      dpkg-query -W -f="${Version}\n" openscad-nightly
       dpkg-query -L openscad-nightly \
         | while IFS= read -r path; do
             if [[ -f "$path" || -L "$path" ]]; then printf "%s\n" "$path"; fi
