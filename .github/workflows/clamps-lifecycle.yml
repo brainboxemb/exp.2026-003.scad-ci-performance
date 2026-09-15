@@ -1,0 +1,391 @@
+name: Clamps lifecycle topology benchmark
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: clamps-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: read
+
+env:
+  SCAD_IMAGE: ghcr.io/brainboxemb/scad-toolchain:v0.4.1
+  CLAMPS_SOURCE_SHA: bb071329e1d6c764d09f87ecd2cc78d42ac73679
+  CLAMPS_BASE_SHA: 52048164db5e5da0b9522c758551bc3af65cae45
+  CLAMPS_PR_NUMBER: '7'
+  CLAMPS_PR_REF: feature/pr-7-m004-common-production
+  AFFECTED_TASK: consumer:scad.production-impact
+  AGGREGATE_TASK: consumer:scad.ci
+
+jobs:
+  relevant-single-host:
+    name: C lifecycle - relevant change
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Start lifecycle timer
+        shell: bash
+        run: echo "LIFECYCLE_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Checkout exact clamps candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: brainboxemb/lib.scad.clamps
+          ref: ${{ env.CLAMPS_SOURCE_SHA }}
+          path: clamps
+          fetch-depth: 1
+          filter: blob:none
+          submodules: false
+          persist-credentials: false
+
+      - name: Fetch exact clamps comparison base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C clamps fetch --no-tags --depth=1 origin "$CLAMPS_BASE_SHA"
+          git -C clamps rev-parse --verify "${CLAMPS_BASE_SHA}^{commit}"
+          echo "CHECKOUT_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Start affected preflight timer
+        shell: bash
+        run: echo "PREFLIGHT_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Query released Moon affected preflight
+        id: affected
+        uses: brainboxemb/tool.git-project/moon/affected@v0.2.6
+        with:
+          task: ${{ env.AFFECTED_TASK }}
+          base: ${{ env.CLAMPS_BASE_SHA }}
+          head: ${{ env.CLAMPS_SOURCE_SHA }}
+          working-directory: clamps
+          evidence-directory: .moon/preflight-lifecycle-c
+
+      - name: Validate relevant preflight
+        shell: bash
+        env:
+          AFFECTED: ${{ steps.affected.outputs.affected }}
+        run: |
+          set -euo pipefail
+          echo "PREFLIGHT_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          test "$AFFECTED" = true
+          cat clamps/.moon/preflight-lifecycle-c/decision.json
+
+      - name: Restore portable Moon task cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            clamps/.moon/cache/hashes
+            clamps/.moon/cache/outputs
+          key: clamps-lifecycle-c-moon-2.5.4-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            clamps-lifecycle-c-moon-2.5.4-${{ runner.os }}-
+
+      - name: Pull exact SCAD toolchain image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "DOCKER_SETUP_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$SCAD_IMAGE"
+          echo "DOCKER_SETUP_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Run exact clamps production graph in Docker process
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PRODUCTION_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+          moon_runtime="$RUNNER_TEMP/tool-git-project/moon-runtime"
+          test -d "$moon_runtime"
+
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e CI=true \
+            -e GITHUB_ACTIONS=true \
+            -e GITHUB_WORKSPACE=/work \
+            -e GITHUB_REPOSITORY=brainboxemb/lib.scad.clamps \
+            -e GITHUB_EVENT_NAME=pull_request \
+            -e GITHUB_REF_TYPE=branch \
+            -e GITHUB_REF_NAME="$CLAMPS_PR_REF" \
+            -e GITHUB_HEAD_REF="$CLAMPS_PR_REF" \
+            -e SCAD_PROJECT_PR_NUMBER="$CLAMPS_PR_NUMBER" \
+            -e SCAD_PROJECT_SOURCE_SHA="$CLAMPS_SOURCE_SHA" \
+            -e SCAD_PROJECT_WORKFLOW_VERSION=v0.13.0 \
+            -e SCAD_TOOLCHAIN_IMAGE="$SCAD_IMAGE" \
+            -e SCAD_TOOLCHAIN_VERSION=v0.4.1 \
+            -e MOON_BASE="$CLAMPS_BASE_SHA" \
+            -e MOON_HEAD="$CLAMPS_SOURCE_SHA" \
+            -e MOON_INSTALL_ROOT=/moon-runtime \
+            -e AGGREGATE_TASK="$AGGREGATE_TASK" \
+            -v "$GITHUB_WORKSPACE/clamps:/work" \
+            -v "$moon_runtime:/moon-runtime" \
+            -w /work \
+            "$SCAD_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /work
+              bash ./bootstrap.sh
+              git config --global --add safe.directory /work/tools/tool.git-project
+              git config --global --add safe.directory /work/tools/tool.scad-project
+              tools/tool.git-project/git-project.sh validate --repo .
+              bash ./tools/tool.scad-project/scad-project.sh tooling-check
+              scad-toolchain-info
+              printf "tool.git-project: %s\n" "$(git -C tools/tool.git-project rev-parse HEAD)"
+              printf "tool.scad-project: %s\n" "$(git -C tools/tool.scad-project rev-parse HEAD)"
+              bash ./tools/tool.git-project/moon-project.sh run "$AGGREGATE_TASK" --repo .
+            '
+
+          echo "PRODUCTION_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Validate and stage generated output on host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d clamps/bld
+          test -d clamps/vrf/out
+          find clamps/bld -mindepth 1 -print -quit | grep -q .
+          find clamps/vrf/out -mindepth 1 -print -quit | grep -q .
+
+          evidence_dir="clamps/.moon/invocations/consumer_scad.ci"
+          test -s "$evidence_dir/moon.log"
+          test -s "$evidence_dir/materialization.json"
+
+          SOURCE_SHA="$CLAMPS_SOURCE_SHA" EVIDENCE_DIR="$evidence_dir" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["EVIDENCE_DIR"]) / "materialization.json"
+          data = json.loads(path.read_text(encoding="utf-8"))
+          expected = {
+              "task": "consumer:scad.ci",
+              "source_revision": os.environ["SOURCE_SHA"],
+              "status": "success",
+              "exit_code": 0,
+          }
+          for key, value in expected.items():
+              if data.get(key) != value:
+                  raise SystemExit(f"{path}: {key} mismatch: {data.get(key)!r} != {value!r}")
+          print(json.dumps(data, indent=2))
+          PY
+
+          build_staging="$RUNNER_TEMP/clamps-build-publication"
+          verification_staging="$RUNNER_TEMP/clamps-verification-publication"
+          rm -rf "$build_staging" "$verification_staging"
+          mkdir -p "$build_staging/orchestration" "$verification_staging/orchestration"
+          cp -a clamps/bld/. "$build_staging/"
+          cp -a clamps/vrf/out/. "$verification_staging/"
+          for staging in "$build_staging" "$verification_staging"; do
+            cp "$evidence_dir/moon.log" "$staging/orchestration/moon.log"
+            cp "$evidence_dir/materialization.json" "$staging/orchestration/materialization.json"
+          done
+
+      - name: Publish both prepared trees from the same host job
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BENCHMARK_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BENCHMARK_SOURCE_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          BENCHMARK_PR_NUMBER: ${{ github.event.pull_request.number || '0' }}
+        run: |
+          set -euo pipefail
+          echo "PUBLICATION_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+          credential_file="$RUNNER_TEMP/lifecycle-git-credentials"
+          printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$credential_file"
+          chmod 600 "$credential_file"
+
+          current_benchmark_revision() {
+            git -c credential.helper="store --file=$credential_file" \
+              ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/${BENCHMARK_SOURCE_REF}" \
+              | awk 'NR == 1 {print $1}'
+          }
+
+          expected="$(current_benchmark_revision)"
+          test "$expected" = "$BENCHMARK_SOURCE_SHA"
+
+          publish_tree() {
+            local source_dir="$1"
+            local suffix="$2"
+            local target_branch
+            if [[ "$BENCHMARK_PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              target_branch="dev/pr-${BENCHMARK_PR_NUMBER}/${suffix}"
+            else
+              target_branch="benchmark/${GITHUB_RUN_ID}/${suffix}"
+            fi
+
+            local repo_dir
+            repo_dir="$(mktemp -d "$RUNNER_TEMP/lifecycle-publish-XXXXXX")"
+            git -C "$repo_dir" init -q
+            git -C "$repo_dir" config user.name 'github-actions[bot]'
+            git -C "$repo_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git -C "$repo_dir" config credential.helper "store --file=$credential_file"
+            git -C "$repo_dir" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+            git -C "$repo_dir" switch --orphan generated-output-publication >/dev/null
+            cp -a "$source_dir/." "$repo_dir/"
+            git -C "$repo_dir" add .
+            git -C "$repo_dir" commit -q -m "Benchmark same-job publication to ${target_branch}"
+
+            local latest
+            latest="$(current_benchmark_revision)"
+            test "$latest" = "$BENCHMARK_SOURCE_SHA"
+            git -C "$repo_dir" push --force origin "HEAD:refs/heads/${target_branch}"
+            rm -rf "$repo_dir"
+          }
+
+          publish_tree "$RUNNER_TEMP/clamps-build-publication" clamps-lifecycle-build
+          publish_tree "$RUNNER_TEMP/clamps-verification-publication" clamps-lifecycle-verification
+
+          echo "PUBLICATION_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Record lifecycle metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          lifecycle_end_ns="$(date +%s%N)"
+          mkdir -p lifecycle-evidence/relevant
+          cp clamps/.moon/preflight-lifecycle-c/decision.json lifecycle-evidence/relevant/preflight-decision.json
+          cp clamps/.moon/invocations/consumer_scad.ci/materialization.json lifecycle-evidence/relevant/materialization.json
+
+          LIFECYCLE_END_NS="$lifecycle_end_ns" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def ms(start, end):
+              return round((int(os.environ[end]) - int(os.environ[start])) / 1_000_000, 3)
+
+          data = {
+              "schema": "brainboxemb.scad-ci-lifecycle.v1",
+              "variant": "C-single-host-docker-run",
+              "scenario": "relevant-step5-candidate",
+              "clamps_source": os.environ["CLAMPS_SOURCE_SHA"],
+              "clamps_base": os.environ["CLAMPS_BASE_SHA"],
+              "scad_image": os.environ["SCAD_IMAGE"],
+              "timing_ms": {
+                  "checkout_and_base_fetch": ms("LIFECYCLE_START_NS", "CHECKOUT_END_NS"),
+                  "affected_preflight": ms("PREFLIGHT_START_NS", "PREFLIGHT_END_NS"),
+                  "docker_pull": ms("DOCKER_SETUP_START_NS", "DOCKER_SETUP_END_NS"),
+                  "container_production": ms("PRODUCTION_START_NS", "PRODUCTION_END_NS"),
+                  "same_job_publication": ms("PUBLICATION_START_NS", "PUBLICATION_END_NS"),
+                  "measured_lifecycle": round((int(os.environ["LIFECYCLE_END_NS"]) - int(os.environ["LIFECYCLE_START_NS"])) / 1_000_000, 3),
+              },
+              "github": {
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              },
+              "container_starts": 1,
+              "github_jobs_for_lifecycle": 1,
+          }
+          path = Path("lifecycle-evidence/relevant/metrics.json")
+          path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          print(path.read_text())
+          PY
+
+      - name: Upload relevant lifecycle evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clamps-lifecycle-c-relevant
+          path: lifecycle-evidence/relevant
+          if-no-files-found: error
+          retention-days: 14
+
+  readme-unaffected-single-host:
+    name: C lifecycle - README only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Start lifecycle timer
+        shell: bash
+        run: echo "LIFECYCLE_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Checkout exact clamps candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: brainboxemb/lib.scad.clamps
+          ref: ${{ env.CLAMPS_SOURCE_SHA }}
+          path: clamps
+          fetch-depth: 1
+          filter: blob:none
+          submodules: false
+          persist-credentials: false
+
+      - name: Create local README-only source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C clamps config user.name 'benchmark'
+          git -C clamps config user.email 'benchmark@example.invalid'
+          printf '\n<!-- lifecycle benchmark README-only change -->\n' >> clamps/README.md
+          git -C clamps add README.md
+          git -C clamps commit -q -m 'Benchmark README-only source'
+          source_sha="$(git -C clamps rev-parse HEAD)"
+          echo "README_SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+          echo "PREFLIGHT_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Query released Moon affected preflight
+        id: affected
+        uses: brainboxemb/tool.git-project/moon/affected@v0.2.6
+        with:
+          task: ${{ env.AFFECTED_TASK }}
+          base: ${{ env.CLAMPS_SOURCE_SHA }}
+          head: ${{ env.README_SOURCE_SHA }}
+          working-directory: clamps
+          evidence-directory: .moon/preflight-lifecycle-c-readme
+
+      - name: Prove no SCAD container is needed
+        shell: bash
+        env:
+          AFFECTED: ${{ steps.affected.outputs.affected }}
+        run: |
+          set -euo pipefail
+          test "$AFFECTED" = false
+          preflight_end_ns="$(date +%s%N)"
+          lifecycle_end_ns="$preflight_end_ns"
+          mkdir -p lifecycle-evidence/readme
+          cp clamps/.moon/preflight-lifecycle-c-readme/decision.json lifecycle-evidence/readme/preflight-decision.json
+
+          PREFLIGHT_END_NS="$preflight_end_ns" LIFECYCLE_END_NS="$lifecycle_end_ns" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data = {
+              "schema": "brainboxemb.scad-ci-lifecycle.v1",
+              "variant": "C-single-host-docker-run",
+              "scenario": "readme-only-unaffected",
+              "base": os.environ["CLAMPS_SOURCE_SHA"],
+              "source": os.environ["README_SOURCE_SHA"],
+              "timing_ms": {
+                  "affected_preflight": round((int(os.environ["PREFLIGHT_END_NS"]) - int(os.environ["PREFLIGHT_START_NS"])) / 1_000_000, 3),
+                  "measured_lifecycle": round((int(os.environ["LIFECYCLE_END_NS"]) - int(os.environ["LIFECYCLE_START_NS"])) / 1_000_000, 3),
+              },
+              "container_starts": 0,
+              "github_jobs_for_lifecycle": 1,
+              "affected": False,
+              "github": {
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              },
+          }
+          path = Path("lifecycle-evidence/readme/metrics.json")
+          path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          print(path.read_text())
+          PY
+
+      - name: Upload README-only lifecycle evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clamps-lifecycle-c-readme
+          path: lifecycle-evidence/readme
+          if-no-files-found: error
+          retention-days: 14
