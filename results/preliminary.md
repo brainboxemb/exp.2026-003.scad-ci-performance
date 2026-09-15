@@ -32,7 +32,7 @@ Cold cached-host setup included:
 
 A and C produced byte-identical STL and watermarked PNG output. B produced the same watermarked PNG bytes, but its STL bytes differ slightly because the dated official AppImage is not the exact same OpenSCAD package build as the OBS nightly frozen in the Docker image.
 
-## Warm cached-host rerun
+## Warm-cache rerun attached to run 34951061705
 
 The rerun restored cache key `openscad-linux-x86_64-2026.09.09` successfully (~79 MB), so the AppImage itself was warm.
 
@@ -49,6 +49,20 @@ Observed workload in that sample:
 
 The large STL-time variation reinforces the need for several repetitions before interpreting runtime differences. The structural observation is already stable: an AppImage cache hit alone does not remove host runtime provisioning on the current GitHub runner image.
 
+## Run 34951397954 — second full execution
+
+This full run used fresh GitHub runners while the OpenSCAD AppImage cache was already populated.
+
+| Variant | Tool setup | STL | PNG | Watermark | Workload total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A — job container | ~15.7 s container initialization | 241.9 ms | 408.6 ms | 107.5 ms | 762.3 ms |
+| B — cached host, warm AppImage | 11.95 s | 482.7 ms | 2563.6 ms | 85.1 ms | 3135.9 ms |
+| C — host + docker pull/run | 25.68 s | 179.1 ms | 339.6 ms | 86.2 ms | 608.4 ms |
+
+The host cache restore itself took about 2.0 s, but B still had to run `apt update/install` on the clean runner. C demonstrates substantial registry/layer-pull variation between runners: the exact same immutable image took materially longer to pull in this sample than in the first run.
+
+Across both full samples, the Docker OpenSCAD runtime remains much faster on this fixture than the AppImage runtime. The watermark itself is not a differentiator: it remains roughly 0.09–0.11 s and the final PNG hash is identical across all variants.
+
 ## Current non-conclusions
 
-Do **not** yet conclude that Docker should be retained or removed. The next repetitions should establish distributions for job-container startup, explicit Docker pull, cached-host setup, and workload runtime. If the historical host action remains disadvantaged by package provisioning, a separate optimized-host variant can test whether caching the complete user-space toolchain changes the result.
+Do **not** yet conclude that Docker should be retained or removed. More repetitions are needed to establish distributions for job-container startup, explicit Docker pull, cached-host setup, and workload runtime. If the historical host action remains disadvantaged by package provisioning, a separate optimized-host variant should test whether caching a more complete user-space toolchain changes the result.
