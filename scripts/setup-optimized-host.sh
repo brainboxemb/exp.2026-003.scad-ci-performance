@@ -30,6 +30,10 @@ if [[ ! -f "$ready_file" ]]; then
         | tar -h -cf - -T -
     ' | tar -xf - -C "$rootfs"
 
+    # Build one recursive runtime closure. Mesa DRI drivers are roots as well as
+    # OpenSCAD and Qt plugins; otherwise their dynamically linked software-render
+    # dependencies (for example LLVM) are absent even though the driver .so files
+    # themselves were copied.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       declare -A seen=()
@@ -39,7 +43,8 @@ if [[ ! -f "$ready_file" ]]; then
       done
       for dir in \
         /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms \
-        /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats; do
+        /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats \
+        /usr/lib/x86_64-linux-gnu/dri; do
         if [[ -d "$dir" ]]; then
           while IFS= read -r plugin; do queue+=("$plugin"); done < <(find "$dir" \( -type f -o -type l \) -name "*.so*")
         fi
@@ -68,11 +73,12 @@ if [[ ! -f "$ready_file" ]]; then
       rm -f "$paths_file"
     ' | tar -xf - -C "$rootfs"
 
+    # Non-ELF GLVND/Mesa configuration is loaded dynamically and therefore is not
+    # discoverable through ldd.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       paths_file="$(mktemp)"
       for path in \
-        /usr/lib/x86_64-linux-gnu/dri \
         /usr/share/glvnd/egl_vendor.d \
         /usr/share/drirc.d; do
         if [[ -d "$path" ]]; then
@@ -120,12 +126,10 @@ actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
 [[ "$actual_sha" == "$expected_binary_sha" ]]
 
 # Generate the launcher from repository code on every run instead of treating it
-# as cached payload. Executing the cached binary normally is intentional: OpenSCAD
-# derives its resource directory from boost::dll::program_location(). Invoking the
-# image ELF loader directly makes the loader appear to be the application and
-# breaks lookup of shaders/locale under ../share/openscad*. The host loader is the
-# sole remaining host runtime component; all resolved shared libraries, Qt plugins,
-# Mesa drivers and GLVND metadata still come from the immutable image bundle.
+# as cached payload. Executing the cached binary normally preserves OpenSCAD's
+# application/resource path. The host loader is the sole remaining host runtime
+# component; resolved shared libraries, Qt plugins, Mesa drivers and GLVND
+# metadata come from the immutable image bundle.
 cat > "$wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
