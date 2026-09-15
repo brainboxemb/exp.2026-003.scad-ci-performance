@@ -34,9 +34,7 @@ if [[ ! -f "$ready_file" ]]; then
     ' | tar -xf - -C "$rootfs"
 
     # Build a recursive shared-library closure for the exact OpenSCAD binary and
-    # the Qt plugins used by headless PNG rendering. A one-level ldd scan misses
-    # dependencies such as pulseaudio/libpulsecommon, so traverse dependencies
-    # until no new library paths are discovered.
+    # Qt plugins used by headless rendering.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       declare -A seen=()
@@ -72,6 +70,25 @@ if [[ ! -f "$ready_file" ]]; then
       rm -f "$paths_file"
     ' | tar -xf - -C "$rootfs"
 
+    # EGL/Mesa loads drivers and vendor metadata dynamically, so ldd cannot see
+    # them. Carry the exact image resources needed by the offscreen renderer.
+    docker run --rm "$image" bash -lc '
+      set -euo pipefail
+      paths_file="$(mktemp)"
+      for path in \
+        /usr/lib/x86_64-linux-gnu/dri \
+        /usr/share/glvnd/egl_vendor.d \
+        /usr/share/drirc.d; do
+        if [[ -d "$path" ]]; then
+          find "$path" \( -type f -o -type l \) -print >> "$paths_file"
+        elif [[ -f "$path" || -L "$path" ]]; then
+          printf "%s\n" "$path" >> "$paths_file"
+        fi
+      done
+      sort -u "$paths_file" | tar -h -cf - -T -
+      rm -f "$paths_file"
+    ' | tar -xf - -C "$rootfs"
+
     python3 -m pip install \
       --disable-pip-version-check \
       --no-compile \
@@ -101,14 +118,25 @@ while IFS= read -r relative_dir; do
   relative_dir="${relative_dir#./}"
   [[ -n "$relative_dir" ]] && lib_paths+=("$rootfs/$relative_dir")
 done < "$bundle_dir/library-dirs.txt"
-if (( ${#lib_paths[@]} > 0 )); then
-  joined_libs="$(IFS=:; echo "${lib_paths[*]}")"
-  export LD_LIBRARY_PATH="$joined_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
+joined_libs="$(IFS=:; echo "${lib_paths[*]}")"
+
 export QT_QPA_PLATFORM=offscreen
 qt_plugins="$rootfs/usr/lib/x86_64-linux-gnu/qt6/plugins"
 [[ -d "$qt_plugins" ]] && export QT_PLUGIN_PATH="$qt_plugins"
-exec "$rootfs/usr/bin/openscad-nightly" "$@"
+dri="$rootfs/usr/lib/x86_64-linux-gnu/dri"
+[[ -d "$dri" ]] && export LIBGL_DRIVERS_PATH="$dri"
+egl_vendor="$rootfs/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+[[ -f "$egl_vendor" ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="$egl_vendor"
+
+# Use the same ELF loader as the immutable image as well as the same library
+# closure. This prevents the host runner's loader/runtime from becoming another
+# uncontrolled benchmark variable.
+loader="$rootfs/lib64/ld-linux-x86-64.so.2"
+if [[ ! -x "$loader" ]]; then
+  loader="$rootfs/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+fi
+test -x "$loader"
+exec "$loader" --library-path "$joined_libs" "$rootfs/usr/bin/openscad-nightly" "$@"
 EOF
     chmod +x "$wrapper"
 
@@ -128,8 +156,8 @@ test -s "$library_dirs_file"
 actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
 [[ "$actual_sha" == "$expected_binary_sha" ]]
 
-# Keep the image-derived library closure scoped to the OpenSCAD wrapper. Only
-# the exact cached Pillow is exposed to the host Python watermark process.
+# Keep the image-derived loader/library closure scoped to the OpenSCAD wrapper.
+# Only the exact cached Pillow is exposed to the host Python watermark process.
 export PYTHONPATH="$python_lib${PYTHONPATH:+:$PYTHONPATH}"
 
 "$wrapper" --version
