@@ -34,6 +34,9 @@ if [[ ! -f "$ready_file" ]]; then
       set -euo pipefail
       declare -A seen=()
       queue=(/usr/bin/openscad-nightly)
+      for loader in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2; do
+        [[ -e "$loader" ]] && queue+=("$loader")
+      done
       for dir in \
         /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms \
         /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats; do
@@ -56,7 +59,7 @@ if [[ ! -f "$ready_file" ]]; then
           [[ -n "${seen[$dep]+x}" ]] || queue+=("$dep")
         done < <(
           ldd "$target" 2>/dev/null \
-            | awk '\''/=> \/[^ ]+/ {print $3} /^\// {print $1}'\'' \
+            | awk '\''/=> \/[^ ]+/ {print $3} $1 ~ /^\// {print $1}'\'' \
             | sort -u
         )
       done
