@@ -11,7 +11,14 @@ All variants use the same `fixture/benchmark.scad` and `scripts/run-benchmark.sh
 3. Pillow watermark;
 4. non-empty validation and SHA-256 evidence.
 
-Docker variants use `ghcr.io/brainboxemb/scad-toolchain:v0.4.1`, which reports `OpenSCAD version 2026.09.09.nightly`. The cached-host action is pinned to the matching dated AppImage snapshot `2026.09.09`.
+Docker variants use `ghcr.io/brainboxemb/scad-toolchain:v0.4.1`, which reports `OpenSCAD version 2026.09.09.nightly`. The historical cached-host action is pinned to the matching dated AppImage snapshot `2026.09.09`, but that AppImage is not the same package build as the Docker image.
+
+The immutable Docker image contains:
+
+- Debian package `openscad-nightly=20260909T191259.git33e8fdd8.debian-0`;
+- `/usr/bin/openscad-nightly` SHA-256 `2ae45a19d347c39338f8ffa4b5468f097b96419f23fb814e08cbaed8b965f4e2`.
+
+The live OBS repository no longer offers that exact package version. Variant D therefore derives its exact host bundle from the immutable v0.4.1 image on a cold cache miss, verifies the binary hash above, and stores the resulting user-space bundle in Actions cache. A warm D run must not use Docker or apt.
 
 ## Run 34951061705 — first execution
 
@@ -30,7 +37,7 @@ Cold cached-host setup included:
 - checksum verification and AppImage extraction;
 - saving the ~79 MB Actions cache.
 
-A and C produced byte-identical STL and watermarked PNG output. B produced the same watermarked PNG bytes, but its STL bytes differ slightly because the dated official AppImage is not the exact same OpenSCAD package build as the OBS nightly frozen in the Docker image.
+A and C produced byte-identical STL and watermarked PNG output. B produced the same watermarked PNG bytes, but its STL bytes differ because the dated official AppImage is not the exact same OpenSCAD package build as the OBS nightly frozen in the Docker image.
 
 ## Warm-cache rerun attached to run 34951061705
 
@@ -75,27 +82,55 @@ B again restored the ~79 MB AppImage from cache quickly, but spent most of setup
 
 ## Phase-one pattern
 
-Three complete A/B/C runs plus one additional warm-host rerun now show a repeatable structural pattern:
+Three complete A/B/C runs plus one additional warm-host rerun show a repeatable structural pattern:
 
 - **A — job-level container:** startup is roughly 16–18 s; the measured OpenSCAD workload is stable around 0.76 s.
-- **B — historical cached-host action:** a warm AppImage can make nominal setup faster than A (about 12 s in two normal samples), but the clean runner still needs host-package provisioning and the AppImage workload is materially slower and variable (~3.1–6.3 s across warm samples).
-- **C — explicit `docker pull` + `docker run`:** OpenSCAD execution is as fast as A, but image-pull latency is more variable and was ~25–26 s in two of three samples. It currently has no performance case over GitHub's native job-container boundary.
-- **Watermark:** ~0.09–0.12 s everywhere. The final watermarked PNG is byte-identical across all three variants, so watermarking is included without confounding the execution-boundary result.
+- **B — historical cached-host action:** a warm AppImage can make nominal setup faster than A (about 12 s in two normal samples), but the clean runner still needs host-package provisioning and the AppImage workload is materially slower and variable.
+- **C — explicit `docker pull` + `docker run`:** OpenSCAD execution is as fast as A, but image-pull latency is more variable and often materially worse than GitHub's native job-container boundary.
+- **Watermark:** roughly 0.09–0.12 s everywhere. The final watermarked PNG is byte-identical across A/B/C.
 
-For the production decision, B is still not an exact-equivalence implementation: it uses the official dated AppImage (`2026.09.09`) while A/C use the OBS nightly package frozen in the v0.4.1 image (`2026.09.09.nightly`). That difference is visible in STL bytes and likely contributes to runtime differences.
+For the production decision, B is not an exact-equivalence implementation: it uses the official dated AppImage (`2026.09.09`) while A/C use the OBS nightly package frozen in the v0.4.1 image (`2026.09.09.nightly`).
 
-## Next experiment
+## Variant D — exact cached host bundle
 
-The historical cached-host action is useful evidence but not the strongest possible host design because it caches only the AppImage. The next variant should therefore test a **complete cached user-space host bundle**:
+Variant D tests a stronger host-cache design. On a cold miss it derives a user-space bundle from the immutable Docker image containing the exact OpenSCAD package payload, recursive dynamic-library closure, Qt rendering plugins, Mesa/EGL resources, and Pillow 12.3.0. The OpenSCAD process is launched through the image-derived ELF loader. The image-derived runtime is scoped to OpenSCAD; the watermark remains a host-Python process using the cached Pillow package.
 
-- pre-extracted OpenSCAD snapshot;
-- cached user-space EGL/OpenGL runtime libraries required by that AppImage where feasible;
-- cached/pinned Pillow rather than `apt install` on every runner;
-- no `apt update/install` on the warm path;
-- the same benchmark workload and watermark.
+This is deliberately more demanding than B: D tests whether the container execution boundary can be removed **without changing the OpenSCAD binary**.
 
-If that design cannot be made self-contained without effectively maintaining a second container-like runtime bundle, record that as a maintenance/reproducibility cost rather than hiding it from the comparison.
+### Run 34953456808 — first successful cold D bundle
+
+All four variants succeeded in this run.
+
+| Variant | Tool setup | STL | PNG | Watermark | Workload total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A — job container | ~16.2 s container initialization | 246.3 ms | 422.3 ms | 109.9 ms | 782.5 ms |
+| B — cached host AppImage | 18.42 s | 8247.5 ms | 5429.3 ms | 114.0 ms | 13795.9 ms |
+| C — host + docker pull/run | 15.98 s | 226.2 ms | 406.0 ms | 118.5 ms | 754.8 ms |
+| D — exact cached host, cold | 28.31 s | 465.4 ms | 4348.0 ms | 132.2 ms | 4949.6 ms |
+
+D produced and saved a **178 MB uncompressed host bundle**, compressed to about **71.8 MB** in Actions cache. Its OpenSCAD executable reports the same nightly version and matches the exact Docker binary SHA-256.
+
+Functional-equivalence evidence is mixed:
+
+- D's final watermarked PNG SHA-256 is `39e2904488000be0d782cc5e4c119d157ec101beaabe1798d09126b6cf9f0dcb`, **byte-identical to A and C** on this fixture.
+- D's STL SHA-256 is `1c511652e554a669e8082115426dd4ca1988a7747d00db52a8cf63c5cc35f17e`, while A/C produce `958c62133b6d0c13351adb738d2f59a646d7a1f4b5dc662366d6d877de915c8a`.
+- D still reports `EGL_BAD_DISPLAY`, localization warnings, and missing `ViewEdges.frag` / `ViewEdges.vert` resources. The matching PNG therefore does not yet prove that the cached host runtime is generally equivalent to the container runtime.
+
+The differing STL must not be dismissed as harmless serialization variance without further checking. D is therefore still an experimental runtime, not a candidate production replacement yet.
+
+## Next measurement — warm D
+
+The v5 exact-host cache from run `34953456808` is now populated. The next run must verify that D:
+
+1. restores `scad-exact-host-v5-ubuntu24-x64-image-v0.4.1-pillow12.3.0` from cache;
+2. skips GHCR authentication and does not execute Docker or apt in the D job;
+3. verifies the exact OpenSCAD binary hash;
+4. runs the same STL + PNG + watermark workload;
+5. records warm setup and workload timing;
+6. retains the current output-equivalence warnings explicitly.
+
+Only after that warm measurement should we decide whether resolving the remaining resource-path/STL difference is worth further engineering. If warm D is not materially better than A, the extra bundle construction and runtime-maintenance complexity is itself sufficient evidence against replacing the job-container model.
 
 ## Current non-conclusion
 
-Do **not** yet change Migration 004's production runtime based on phase one alone. Job-level Docker is currently the most stable complete runtime; the dedicated optimized-host variant is needed to test whether host caching can remove the setup penalty without sacrificing reproducibility or creating a second toolchain distribution format.
+Do **not** yet change Migration 004's production runtime. Job-level Docker remains the most stable complete runtime. Variant D has shown that an exact-binary cached host bundle is technically possible, but it currently requires a second distribution format and is not yet fully output-equivalent. The warm D measurement is the next decision point.
