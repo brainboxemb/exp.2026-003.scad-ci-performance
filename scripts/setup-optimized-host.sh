@@ -104,37 +104,6 @@ if [[ ! -f "$ready_file" ]]; then
       find . -type f -name '*.so*' -printf '%h\n' | sort -u
     ) > "$library_dirs_file"
 
-    cat > "$wrapper" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-bundle_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-rootfs="$bundle_dir/rootfs"
-lib_paths=()
-while IFS= read -r relative_dir; do
-  relative_dir="${relative_dir#./}"
-  [[ -n "$relative_dir" ]] && lib_paths+=("$rootfs/$relative_dir")
-done < "$bundle_dir/library-dirs.txt"
-joined_libs="$(IFS=:; echo "${lib_paths[*]}")"
-
-export QT_QPA_PLATFORM=offscreen
-qt_plugins="$rootfs/usr/lib/x86_64-linux-gnu/qt6/plugins"
-[[ -d "$qt_plugins" ]] && export QT_PLUGIN_PATH="$qt_plugins"
-dri="$rootfs/usr/lib/x86_64-linux-gnu/dri"
-[[ -d "$dri" ]] && export LIBGL_DRIVERS_PATH="$dri"
-egl_vendor="$rootfs/usr/share/glvnd/egl_vendor.d/50_mesa.json"
-[[ -f "$egl_vendor" ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="$egl_vendor"
-
-loader="$(find "$rootfs" \( -type f -o -type l \) -name 'ld-linux-x86-64.so.2' -print -quit)"
-if [[ -z "$loader" || ! -x "$loader" ]]; then
-  echo "ERROR: exact image ELF loader not found in cached bundle." >&2
-  find "$rootfs" -maxdepth 4 -name 'ld-linux*' -ls >&2 || true
-  exit 1
-fi
-
-exec "$loader" --library-path "$joined_libs" "$rootfs/usr/bin/openscad-nightly" "$@"
-EOF
-    chmod +x "$wrapper"
-
     cat > "$ready_file" <<EOF
 source_image=$image
 openscad_package=$package_version
@@ -146,10 +115,43 @@ fi
 
 openscad_bin="$rootfs/usr/bin/openscad-nightly"
 test -x "$openscad_bin"
-test -x "$wrapper"
 test -s "$library_dirs_file"
 actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
 [[ "$actual_sha" == "$expected_binary_sha" ]]
+
+# Generate the launcher from repository code on every run instead of treating it
+# as cached payload. Executing the cached binary normally is intentional: OpenSCAD
+# derives its resource directory from boost::dll::program_location(). Invoking the
+# image ELF loader directly makes the loader appear to be the application and
+# breaks lookup of shaders/locale under ../share/openscad*. The host loader is the
+# sole remaining host runtime component; all resolved shared libraries, Qt plugins,
+# Mesa drivers and GLVND metadata still come from the immutable image bundle.
+cat > "$wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+bundle_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+rootfs="$bundle_dir/rootfs"
+lib_paths=()
+while IFS= read -r relative_dir; do
+  relative_dir="${relative_dir#./}"
+  [[ -n "$relative_dir" ]] && lib_paths+=("$rootfs/$relative_dir")
+done < "$bundle_dir/library-dirs.txt"
+if (( ${#lib_paths[@]} > 0 )); then
+  joined_libs="$(IFS=:; echo "${lib_paths[*]}")"
+  export LD_LIBRARY_PATH="$joined_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+export QT_QPA_PLATFORM=offscreen
+qt_plugins="$rootfs/usr/lib/x86_64-linux-gnu/qt6/plugins"
+[[ -d "$qt_plugins" ]] && export QT_PLUGIN_PATH="$qt_plugins"
+dri="$rootfs/usr/lib/x86_64-linux-gnu/dri"
+[[ -d "$dri" ]] && export LIBGL_DRIVERS_PATH="$dri"
+egl_vendor="$rootfs/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+[[ -f "$egl_vendor" ]] && export __EGL_VENDOR_LIBRARY_FILENAMES="$egl_vendor"
+
+exec "$rootfs/usr/bin/openscad-nightly" "$@"
+EOF
+chmod +x "$wrapper"
 
 export PYTHONPATH="$python_lib${PYTHONPATH:+:$PYTHONPATH}"
 
