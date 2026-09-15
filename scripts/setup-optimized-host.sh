@@ -2,6 +2,7 @@
 set -euo pipefail
 
 bundle_root="${1:-.cache/exact-host-toolchain}"
+image="${SCAD_IMAGE:-ghcr.io/brainboxemb/scad-toolchain:v0.4.1}"
 package_version="20260909T191259.git33e8fdd8.debian-0"
 expected_binary_sha="2ae45a19d347c39338f8ffa4b5468f097b96419f23fb814e08cbaed8b965f4e2"
 pillow_version="12.3.0"
@@ -12,36 +13,47 @@ python_lib="$bundle_root/python"
 mkdir -p "$bundle_root"
 
 if [[ ! -f "$ready_file" ]]; then
-    echo "Building exact cached host SCAD bundle from OBS package..."
+    echo "Building exact cached host SCAD bundle from immutable image $image..."
     rm -rf "$bundle_root"
-    mkdir -p "$bundle_root/debs/partial" "$rootfs" "$python_lib"
+    mkdir -p "$rootfs" "$python_lib"
 
-    # Match docker.scad-toolchain:v0.4.1: the immutable image installed
-    # openscad-nightly from the official OpenSCAD OBS repository. Download the
-    # exact package build and whatever runtime dependencies this clean runner is
-    # missing, but do not install them into the host OS.
-    sudo wget -qO /etc/apt/trusted.gpg.d/obs-openscad-nightly.asc \
-      https://files.openscad.org/OBS-Repository-Key.pub
-    echo 'deb https://download.opensuse.org/repositories/home:/t-paul/xUbuntu_24.04/ /' \
-      | sudo tee /etc/apt/sources.list.d/openscad-nightly.list >/dev/null
-    sudo apt-get -o Acquire::Retries=2 update >/dev/null
+    docker pull "$image"
 
-    sudo apt-get \
-      -o Acquire::Retries=2 \
-      -o Dir::Cache::archives="$PWD/$bundle_root/debs" \
-      --download-only \
-      install -y --no-install-recommends \
-      "openscad-nightly=$package_version" >/dev/null
+    # Copy only the openscad-nightly package payload. Avoid archiving directory
+    # entries from dpkg -L because that would recursively pull unrelated files.
+    docker run --rm "$image" bash -lc '
+      set -euo pipefail
+      dpkg-query -W -f="${Version}\n" openscad-nightly
+      dpkg-query -L openscad-nightly \
+        | while IFS= read -r path; do
+            if [[ -f "$path" || -L "$path" ]]; then printf "%s\n" "$path"; fi
+          done \
+        | tar -h -cf - -T -
+    ' | tar -xf - -C "$rootfs"
 
-    shopt -s nullglob
-    packages=("$bundle_root"/debs/*.deb)
-    if (( ${#packages[@]} == 0 )); then
-      echo "ERROR: apt downloaded no packages for exact host bundle." >&2
-      exit 1
-    fi
-    for package in "${packages[@]}"; do
-      dpkg-deb -x "$package" "$rootfs"
-    done
+    # The exact binary is dynamically linked. Cache the shared-library closure
+    # used by the binary plus the Qt offscreen/image plugins needed by CLI PNG
+    # rendering. Host libraries remain fallback; cached copies take precedence.
+    docker run --rm "$image" bash -lc '
+      set -euo pipefail
+      targets=(/usr/bin/openscad-nightly)
+      for dir in \
+        /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms \
+        /usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats; do
+        if [[ -d "$dir" ]]; then
+          while IFS= read -r plugin; do targets+=("$plugin"); done < <(find "$dir" \( -type f -o -type l \) -name "*.so*")
+        fi
+      done
+      {
+        printf "%s\n" "${targets[@]}"
+        for target in "${targets[@]}"; do
+          ldd "$target" 2>/dev/null \
+            | awk '\''/=> \/[^ ]+/ {print $3} /^\// {print $1}'\''
+        done
+      } | sort -u | while IFS= read -r path; do
+        [[ -e "$path" ]] && printf "%s\n" "$path"
+      done | tar -h -cf - -T -
+    ' | tar -xf - -C "$rootfs"
 
     python3 -m pip install \
       --disable-pip-version-check \
@@ -57,8 +69,8 @@ if [[ ! -f "$ready_file" ]]; then
       exit 1
     fi
 
-    rm -rf "$bundle_root/debs"
     cat > "$ready_file" <<EOF
+source_image=$image
 openscad_package=$package_version
 openscad_binary_sha256=$expected_binary_sha
 pillow_version=$pillow_version
@@ -71,9 +83,6 @@ test -x "$openscad_bin"
 actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
 [[ "$actual_sha" == "$expected_binary_sha" ]]
 
-# The download-only apt transaction extracts only dependencies missing from the
-# clean runner. Prefer those cached libraries while retaining the runner's
-# already-present system libraries as fallback.
 lib_paths=()
 for candidate in \
   "$rootfs/usr/lib/x86_64-linux-gnu" \
@@ -87,6 +96,9 @@ if (( ${#lib_paths[@]} > 0 )); then
   export LD_LIBRARY_PATH="$joined_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 export PYTHONPATH="$python_lib${PYTHONPATH:+:$PYTHONPATH}"
+export QT_QPA_PLATFORM=offscreen
+qt_plugins="$rootfs/usr/lib/x86_64-linux-gnu/qt6/plugins"
+[[ -d "$qt_plugins" ]] && export QT_PLUGIN_PATH="$qt_plugins"
 
 "$openscad_bin" --version
 python3 -c 'from PIL import Image; print("Pillow:", Image.__version__)'
@@ -97,7 +109,7 @@ du -sh "$bundle_root"
 {
   echo "OPENSCAD_BIN=$openscad_bin"
   echo "PYTHONPATH=$PYTHONPATH"
-  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
-    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-  fi
+  echo "QT_QPA_PLATFORM=$QT_QPA_PLATFORM"
+  [[ -n "${LD_LIBRARY_PATH:-}" ]] && echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+  [[ -n "${QT_PLUGIN_PATH:-}" ]] && echo "QT_PLUGIN_PATH=$QT_PLUGIN_PATH"
 } >> "$GITHUB_ENV"
