@@ -9,6 +9,7 @@ pillow_version="12.3.0"
 ready_file="$bundle_root/READY"
 rootfs="$bundle_root/rootfs"
 python_lib="$bundle_root/python"
+wrapper="$bundle_root/openscad-exact"
 
 mkdir -p "$bundle_root"
 
@@ -33,7 +34,8 @@ if [[ ! -f "$ready_file" ]]; then
 
     # The exact binary is dynamically linked. Cache the shared-library closure
     # used by the binary plus the Qt offscreen/image plugins needed by CLI PNG
-    # rendering. Host libraries remain fallback; cached copies take precedence.
+    # rendering. Host libraries remain fallback; cached copies take precedence
+    # only inside the wrapper created below.
     docker run --rm "$image" bash -lc '
       set -euo pipefail
       targets=(/usr/bin/openscad-nightly)
@@ -69,20 +71,11 @@ if [[ ! -f "$ready_file" ]]; then
       exit 1
     fi
 
-    cat > "$ready_file" <<EOF
-source_image=$image
-openscad_package=$package_version
-openscad_binary_sha256=$expected_binary_sha
-pillow_version=$pillow_version
-runner_image=ubuntu-24.04
-EOF
-fi
-
-openscad_bin="$rootfs/usr/bin/openscad-nightly"
-test -x "$openscad_bin"
-actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
-[[ "$actual_sha" == "$expected_binary_sha" ]]
-
+    cat > "$wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+bundle_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+rootfs="$bundle_dir/rootfs"
 lib_paths=()
 for candidate in \
   "$rootfs/usr/lib/x86_64-linux-gnu" \
@@ -95,21 +88,39 @@ if (( ${#lib_paths[@]} > 0 )); then
   joined_libs="$(IFS=:; echo "${lib_paths[*]}")"
   export LD_LIBRARY_PATH="$joined_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-export PYTHONPATH="$python_lib${PYTHONPATH:+:$PYTHONPATH}"
 export QT_QPA_PLATFORM=offscreen
 qt_plugins="$rootfs/usr/lib/x86_64-linux-gnu/qt6/plugins"
 [[ -d "$qt_plugins" ]] && export QT_PLUGIN_PATH="$qt_plugins"
+exec "$rootfs/usr/bin/openscad-nightly" "$@"
+EOF
+    chmod +x "$wrapper"
 
-"$openscad_bin" --version
+    cat > "$ready_file" <<EOF
+source_image=$image
+openscad_package=$package_version
+openscad_binary_sha256=$expected_binary_sha
+pillow_version=$pillow_version
+runner_image=ubuntu-24.04
+EOF
+fi
+
+openscad_bin="$rootfs/usr/bin/openscad-nightly"
+test -x "$openscad_bin"
+test -x "$wrapper"
+actual_sha="$(sha256sum "$openscad_bin" | awk '{print $1}')"
+[[ "$actual_sha" == "$expected_binary_sha" ]]
+
+# Keep the image-derived library closure scoped to the OpenSCAD wrapper. Only
+# the exact cached Pillow is exposed to the host Python watermark process.
+export PYTHONPATH="$python_lib${PYTHONPATH:+:$PYTHONPATH}"
+
+"$wrapper" --version
 python3 -c 'from PIL import Image; print("Pillow:", Image.__version__)'
 printf 'Exact OpenSCAD binary SHA-256: %s\n' "$actual_sha"
 printf 'Exact host bundle size: '
 du -sh "$bundle_root"
 
 {
-  echo "OPENSCAD_BIN=$openscad_bin"
+  echo "OPENSCAD_BIN=$wrapper"
   echo "PYTHONPATH=$PYTHONPATH"
-  echo "QT_QPA_PLATFORM=$QT_QPA_PLATFORM"
-  [[ -n "${LD_LIBRARY_PATH:-}" ]] && echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-  [[ -n "${QT_PLUGIN_PATH:-}" ]] && echo "QT_PLUGIN_PATH=$QT_PLUGIN_PATH"
 } >> "$GITHUB_ENV"
