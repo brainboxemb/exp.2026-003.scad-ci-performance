@@ -1,20 +1,14 @@
 # SCAD CI execution benchmark results
 
-## Decision
+## Runtime sub-conclusion
 
-**Retain the GitHub job-level Docker container as the SCAD production runtime for Migration 004.**
+**Retain the immutable Docker SCAD toolchain as the qualified SCAD execution environment.**
 
-The benchmark found a real warm-cache latency opportunity on the host, but no host implementation preserved the same overall execution semantics as `ghcr.io/brainboxemb/scad-toolchain:v0.4.1` without effectively maintaining a second container-like userspace bundle. The strongest exact-binary host experiment still failed to initialize EGL consistently, produced different STL/PNG bytes from Docker, and rendered materially slower. Explicit `docker pull` + `docker run` preserved correctness but did not outperform GitHub's native job-container boundary.
+The benchmark found a real warm-cache latency opportunity on the host, but no host implementation preserved the same overall execution semantics as `ghcr.io/brainboxemb/scad-toolchain:v0.4.1` without effectively maintaining a second container-like userspace bundle. The strongest exact-binary host experiment still failed to initialize EGL consistently, produced different STL/PNG bytes from Docker, and rendered materially slower.
 
-This recommendation does **not** undo the lightweight host preflight. The production model remains:
+Explicit `docker pull` + `docker run` (variant C) *does* preserve the same SCAD runtime and byte-identical fixture output as the job-container reference. It does not make Docker setup itself faster, but this standalone benchmark does **not** measure the full lifecycle advantage for which C was proposed: a single host orchestrator job could remove GitHub job transitions between preflight, SCAD production and host publication.
 
-```text
-host Moon preflight
-  -> if affected: one GitHub SCAD job container
-  -> lightweight publication outside the SCAD container
-```
-
-The performance issue that triggered this experiment should therefore be addressed by reducing serial orchestration/publication overhead around the container, not by replacing the qualified SCAD runtime with cached host tooling.
+Therefore this document settles the **runtime-boundary** question but does not yet close Migration-004 experiment #53.
 
 ## Controlled workload
 
@@ -86,7 +80,7 @@ This established that caching only the AppImage does not remove host runtime pro
 
 - **A — job-level container:** startup roughly 16–18 s in the normal samples; workload stable around 0.76 s.
 - **B — historical cached host:** nominal setup can be somewhat shorter when the AppImage cache is warm, but fresh runners still provision host packages and execution is slower/variable. It is not binary-equivalent to Docker.
-- **C — explicit Docker invocation:** workload matches A and output is byte-identical, but registry/layer-pull latency is more variable and often materially worse than the native job-container boundary.
+- **C — explicit Docker invocation:** workload matches A and output is byte-identical, but registry/layer-pull latency is more variable and often materially worse than the native job-container boundary when only runtime setup is measured.
 
 ## Phase 2 — exact-binary cached host bundle
 
@@ -158,9 +152,9 @@ D produced different output:
 - STL SHA-256: `2d454f3661ae2a92321b62a6c5f4c11856fe5ac08a45fe2876aa45171343d0f9`;
 - watermarked PNG SHA-256: `c5c8b4ad084f0a987f53997fb874adc55b74282a2efe95587078e969b5c13db9`.
 
-Because v6 still failed EGL after including the renderer-driver dependency closure, the pre-declared stop condition was met. No warm-v6 run is needed: cache-restore speed was already proven by v5, while v6 did not restore functional equivalence.
+Because v6 still failed EGL after including the renderer-driver dependency closure, the pre-declared stop condition for host-runtime emulation was met. No warm-v6 run is needed: cache-restore speed was already proven by v5, while v6 did not restore functional equivalence.
 
-## Comparison and recommendation
+## Runtime comparison
 
 | Criterion | A — job container | B — cached AppImage host | C — host + Docker | D — exact cached host bundle |
 | --- | --- | --- | --- | --- |
@@ -171,32 +165,52 @@ Because v6 still failed EGL after including the renderer-driver dependency closu
 | Workload stability | **High** | Low | **High** | Low / EGL fallback |
 | Extra distribution format | No | AppImage + host packages | No | **Yes: ~178 MB reconstructed userspace bundle** |
 | Reproducibility if package feed changes | **Immutable image** | Snapshot server dependent | **Immutable image** | Depends on image-derived cache builder |
-| Maintenance complexity | **Lowest complete runtime** | Host package + AppImage logic | Docker orchestration logic | **Highest** |
+| Maintenance complexity | Low | Host package + AppImage logic | Docker orchestration logic | **Highest** |
 
-### Recommendation
+### Runtime recommendation
 
-Retain **A — the native GitHub job-level Docker container** for affected SCAD production.
+Do **not** replace the immutable Docker SCAD runtime with cached host tooling.
 
 Reasons:
 
 1. A and C repeatedly execute the fixture in roughly **0.6–0.8 s** and produce byte-identical STL/PNG evidence.
-2. C offers no compelling setup advantage over A and can have worse image-pull variance, so replacing the native job-container boundary with explicit `docker run` does not solve the Step-5 latency problem.
-3. B is simpler than D but is not the same OpenSCAD build and still needs runtime provisioning on clean runners.
-4. D proves a warm exact-binary host cache can restore in about **1.2–1.5 s**, but achieving that requires maintaining a second userspace distribution. Even after expanding the closure through Mesa drivers, EGL does not initialize equivalently, output differs, and PNG rendering remains roughly an order of magnitude slower than Docker on the fixture.
-5. The immutable Docker image is also the only tested artifact that still contains the exact OBS package after that version disappeared from the live repository.
+2. B is not the same OpenSCAD build and still needs runtime provisioning on clean runners.
+3. D proves a warm exact-binary host cache can restore in about **1.2–1.5 s**, but achieving that requires maintaining a second userspace distribution. Even after expanding the closure through Mesa drivers, EGL does not initialize equivalently, output differs, and PNG rendering remains roughly an order of magnitude slower than Docker on the fixture.
+4. The immutable Docker image is the tested artifact that still contains the exact OBS package after that version disappeared from the live repository.
+5. C retains exactly the qualified Docker runtime and is therefore the only remaining alternative worth testing at the **workflow topology** level.
 
-Therefore the Step-5 relevant-change regression should be treated as an **orchestration critical-path problem around a qualified runtime**, not as evidence that the runtime boundary itself should move to the host.
+## Next experiment — full lifecycle A versus C
 
-## Consequence for Migration 004
+The standalone runtime benchmark cannot decide whether C improves Migration-004 Step-5 latency, because the current regression includes serial GitHub job boundaries.
 
-Experiment #53 can be closed with the Docker runtime retained.
+The next measurement must compare complete relevant-change lifecycles using `lib.scad.clamps`-representative work:
 
-Step 5 may resume, but its proportionality reassessment should now focus on whether the shared lifecycle can reduce serial overhead while preserving these invariants:
+### A — current released topology
 
-- README-only/unaffected changes start no SCAD container;
-- affected normal CI starts at most one heavy SCAD container;
+```text
+host preflight job
+  -> GitHub job-container production
+  -> lightweight host publication job(s)
+```
+
+### C — host orchestrator topology
+
+```text
+one host job
+  -> Moon affected/preflight
+  -> if affected: docker run exact scad-toolchain:v0.4.1 producer graph
+  -> after container exit: host-side publication/evidence
+```
+
+Required controls:
+
+- same source revision/task graph/SCons behavior;
+- same immutable Docker image and exact tool versions;
+- same generated-output/evidence contract;
+- publication only after the SCAD container process has exited;
+- README-only still performs zero container starts;
+- relevant change performs exactly one container start;
 - Build and Verify remain logically independent;
-- publication remains outside the SCAD container;
-- current Moon/SCons evidence remains understandable and exact-source current.
+- repeated measurements so job scheduling/pull variance is visible.
 
-Do not roll Step 5 into `lib.scad.hub75` until the current `lib.scad.clamps` draft has been re-evaluated with this decision recorded.
+The decision criterion is **end-to-end critical path and runner cost**, not whether `docker run` itself is faster than a job container. Experiment #53 remains open until this comparison is complete. Step 6 must remain blocked.
