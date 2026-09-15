@@ -127,3 +127,42 @@ jobs:
           path: out/host-docker-run
           if-no-files-found: error
           retention-days: 14
+
+  exact-cached-host:
+    name: D - exact cached host package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout benchmark fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Start setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Restore exact host bundle cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .cache/exact-host-toolchain
+          key: scad-exact-host-v1-ubuntu24-x64-20260909T191259-git33e8fdd8-pillow12.3.0
+
+      - name: Prepare exact host bundle
+        shell: bash
+        run: bash scripts/setup-optimized-host.sh .cache/exact-host-toolchain
+
+      - name: Stop setup timer
+        shell: bash
+        run: echo "BENCH_SETUP_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Run common benchmark workload
+        shell: bash
+        run: bash scripts/run-benchmark.sh exact-cached-host
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scad-ci-benchmark-exact-cached-host
+          path: out/exact-cached-host
+          if-no-files-found: error
+          retention-days: 14
