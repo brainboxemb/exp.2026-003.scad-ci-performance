@@ -207,8 +207,10 @@ jobs:
           VERIFICATION_CACHE_HIT: ${{ steps.verification-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          echo "CACHE_SAVE_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          cache_save_end_ns="$(date +%s%N)"
+          export CACHE_SAVE_END_NS="$cache_save_end_ns"
           end_ns="$(date +%s%N)"
+          export BENCHMARK_END_NS="$end_ns"
           mkdir -p benchmark-evidence/reports benchmark-evidence/manifests
 
           cp .moon/preflight/decision.json benchmark-evidence/
@@ -222,10 +224,14 @@ jobs:
           done
 
           {
-            find bld/png bld/svg bld/stl bld/drawing vrf/out               -type f               ! -path '*/evidence/*'               ! -name 'publication-info.txt'               -print0 2>/dev/null             | sort -z             | xargs -0 -r sha256sum
+            for root in bld/png bld/svg bld/stl bld/drawing vrf/out; do
+              if [[ -d "$root" ]]; then
+                find "$root"                   -type f                   ! -path '*/evidence/*'                   ! -name 'publication-info.txt'                   -print0
+              fi
+            done             | sort -z             | xargs -0 -r sha256sum
           } > benchmark-evidence/manifests/generated.sha256
 
-          BENCHMARK_END_NS="$end_ns" python3 - <<'PY'
+          python3 - <<'PY'
           import json
           import os
           from pathlib import Path
