@@ -1,0 +1,132 @@
+name: Moon shallow-history benchmark
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/moon-shallow-history.yml'
+      - 'results/moon-shallow-history.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: shallow-current
+            full_history: 'false'
+            explicit_range: 'false'
+          - variant: shallow-explicit-range
+            full_history: 'false'
+            explicit_range: 'true'
+          - variant: full-history-control
+            full_history: 'true'
+            explicit_range: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Checkout pinned tool.git-project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: brainboxemb/tool.git-project
+          ref: 9879da589101f41b2b0e634d196ddcc51e1a6102
+          path: tool-git-project
+          fetch-depth: 1
+
+      - name: Bootstrap Moon
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "MOON_INSTALL_ROOT=$RUNNER_TEMP/moon-runtime" >> "$GITHUB_ENV"
+          bash tool-git-project/moon-project.sh bootstrap --install-root "$RUNNER_TEMP/moon-runtime"
+
+      - name: Create controlled Git fixture
+        shell: bash
+        env:
+          FULL_HISTORY: ${{ matrix.full_history }}
+        run: |
+          set -euo pipefail
+          seed="$RUNNER_TEMP/seed"
+          origin="$RUNNER_TEMP/origin.git"
+          work="$RUNNER_TEMP/work"
+          git init -q -b main "$seed"
+          git -C "$seed" config user.name benchmark
+          git -C "$seed" config user.email benchmark@example.invalid
+          mkdir -p "$seed/.moon"
+          cat > "$seed/.moon/workspace.yml" <<'EOF'
+          projects:
+            consumer: '.'
+          vcs:
+            client: git
+            provider: github
+            defaultBranch: main
+          telemetry: false
+          pipeline:
+            installDependencies: false
+            syncProjects: false
+            syncWorkspace: false
+          EOF
+          cat > "$seed/moon.yml" <<'EOF'
+          tasks:
+            test:
+              command: 'bash -c "mkdir -p out && printf ok > out/result.txt"'
+              inputs:
+                - 'input.txt'
+              outputs:
+                - 'out/**'
+              options:
+                cache: true
+          EOF
+          printf 'base\n' > "$seed/input.txt"
+          git -C "$seed" add .
+          GIT_AUTHOR_DATE='2026-09-22T08:00:00Z' GIT_COMMITTER_DATE='2026-09-22T08:00:00Z' git -C "$seed" commit -q -m base
+          base_sha="$(git -C "$seed" rev-parse HEAD)"
+          printf 'head\n' > "$seed/input.txt"
+          git -C "$seed" add input.txt
+          GIT_AUTHOR_DATE='2026-09-22T08:01:00Z' GIT_COMMITTER_DATE='2026-09-22T08:01:00Z' git -C "$seed" commit -q -m head
+          head_sha="$(git -C "$seed" rev-parse HEAD)"
+          git clone -q --bare "$seed" "$origin"
+          if [[ "$FULL_HISTORY" == true ]]; then
+            git clone -q "file://$origin" "$work"
+          else
+            git clone -q --depth=1 "file://$origin" "$work"
+            git -C "$work" fetch -q --no-tags --depth=1 origin "$base_sha"
+          fi
+          echo "FIXTURE_BASE_SHA=$base_sha" >> "$GITHUB_ENV"
+          echo "FIXTURE_HEAD_SHA=$head_sha" >> "$GITHUB_ENV"
+          echo "FIXTURE_WORK=$work" >> "$GITHUB_ENV"
+          git -C "$work" rev-parse HEAD
+          git -C "$work" rev-parse --is-shallow-repository
+
+      - name: Run cached task
+        shell: bash
+        env:
+          EXPLICIT_RANGE: ${{ matrix.explicit_range }}
+          CI: 'true'
+          GITHUB_ACTIONS: 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          if [[ "$EXPLICIT_RANGE" == true ]]; then
+            export MOON_BASE="$FIXTURE_BASE_SHA"
+            export MOON_HEAD="$FIXTURE_HEAD_SHA"
+          fi
+          set +e
+          bash tool-git-project/moon-project.sh run consumer:test             --repo "$FIXTURE_WORK"             --install-root "$MOON_INSTALL_ROOT"             --evidence-dir "$GITHUB_WORKSPACE/evidence/invocation"             2>&1 | tee evidence/console.log
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -eq 0
+          warning_count="$(grep -c 'A full Git history is required for affected checks' evidence/console.log || true)"
+          printf '{"variant":"%s","warning_count":%s,"shallow":"%s","explicit_range":"%s"}\n'             '${{ matrix.variant }}' "$warning_count" '${{ matrix.full_history }}' '${{ matrix.explicit_range }}'             > evidence/result.json
+          cat evidence/result.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: moon-shallow-${{ matrix.variant }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 14
