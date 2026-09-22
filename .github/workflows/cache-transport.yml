@@ -12,8 +12,7 @@ permissions:
   packages: read
 
 env:
-  HUB75_SOURCE_SHA: 660b04129bb127d13eaf59dca3c51ffeb8251572
-  HUB75_BASE_SHA: f571179432574002a5ab4e4f85a3fb0af2a9fdcd
+  HUB75_SEED_SHA: 660b04129bb127d13eaf59dca3c51ffeb8251572
   TOOL_GIT_PROJECT_SHA: 9879da589101f41b2b0e634d196ddcc51e1a6102
   SCAD_TOOLCHAIN_VERSION: v0.6.1
   SCAD_PROJECT_WORKFLOW_VERSION: v0.15.2
@@ -41,18 +40,27 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: brainboxemb/2026-009-01.cad.HUB75-display-frame
-          ref: ${{ env.HUB75_SOURCE_SHA }}
+          ref: ${{ env.HUB75_SEED_SHA }}
           fetch-depth: 1
           filter: blob:none
           submodules: false
           persist-credentials: false
 
-      - name: Fetch exact comparison base
+      - name: Create deterministic incremental source probe
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "$HUB75_BASE_SHA"
-          git rev-parse --verify "${HUB75_BASE_SHA}^{commit}"
+          test "$(git rev-parse HEAD)" = "$HUB75_SEED_SHA"
+          git config user.name benchmark
+          git config user.email benchmark@example.invalid
+          printf '\n// exp89 incremental source probe: intentionally no geometry change\n' \
+            >> dsg/openscad/project_components/tube_mount/tube-clamp/hub75_tube_clamp.scad
+          git add dsg/openscad/project_components/tube_mount/tube-clamp/hub75_tube_clamp.scad
+          GIT_AUTHOR_DATE='2026-09-22T08:00:00Z' \
+          GIT_COMMITTER_DATE='2026-09-22T08:00:00Z' \
+            git commit -q -m 'Experiment 89 incremental SCAD source probe'
+          echo "BENCH_BASE_SHA=$HUB75_SEED_SHA" >> "$GITHUB_ENV"
+          echo "BENCH_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Initialize pinned SCAD task policy
         shell: bash
@@ -61,15 +69,17 @@ jobs:
           git submodule update --init --depth 1 -- tools/tool.scad-project
           test "$(git -C tools/tool.scad-project rev-parse HEAD)" = "70fd4162731484a949dc390e942dde8b8d811f10"
           echo "SCAD_PROJECT_TOOL_SHA=$(git -C tools/tool.scad-project rev-parse HEAD)" >> "$GITHUB_ENV"
-          bash tools/tool.scad-project/scripts/fetch_base_gitlink_commit.sh             "$HUB75_BASE_SHA"             tools/tool.scad-project
+          bash tools/tool.scad-project/scripts/fetch_base_gitlink_commit.sh \
+            "$BENCH_BASE_SHA" \
+            tools/tool.scad-project
 
       - name: Query exact affected capabilities
         id: affected
         uses: brainboxemb/tool.git-project/moon/affected@9879da589101f41b2b0e634d196ddcc51e1a6102
         with:
           task: consumer:scad.docs
-          base: ${{ env.HUB75_BASE_SHA }}
-          head: ${{ env.HUB75_SOURCE_SHA }}
+          base: ${{ env.BENCH_BASE_SHA }}
+          head: ${{ env.BENCH_SOURCE_SHA }}
           evidence-directory: .moon/preflight
 
       - name: Set up host Python
@@ -154,7 +164,7 @@ jobs:
           moon_runtime="$RUNNER_TEMP/tool-git-project/moon-runtime"
           test -d "$moon_runtime"
 
-          docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp             -e CI=true             -e GITHUB_ACTIONS=true             -e GITHUB_WORKSPACE=/work             -e GITHUB_REPOSITORY=brainboxemb/2026-009-01.cad.HUB75-display-frame             -e GITHUB_SHA="$HUB75_SOURCE_SHA"             -e SCAD_PROJECT_SOURCE_SHA="$HUB75_SOURCE_SHA"             -e SCAD_PROJECT_TOOL_SHA="$SCAD_PROJECT_TOOL_SHA"             -e SCAD_PROJECT_WORKFLOW_VERSION="$SCAD_PROJECT_WORKFLOW_VERSION"             -e SCAD_TOOLCHAIN_IMAGE="$RUNTIME_IMAGE"             -e SCAD_TOOLCHAIN_VERSION="$SCAD_TOOLCHAIN_VERSION"             -e PYTHONDONTWRITEBYTECODE=1             -e MOON_INSTALL_ROOT=/moon-runtime             -e MATERIALIZATION_CAPABILITIES="$MATERIALIZATION_CAPABILITIES"             -v "$GITHUB_WORKSPACE:/work"             -v "$moon_runtime:/moon-runtime"             -w /work             "$RUNTIME_IMAGE" bash -lc '
+          docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp             -e CI=true             -e GITHUB_ACTIONS=true             -e GITHUB_WORKSPACE=/work             -e GITHUB_REPOSITORY=brainboxemb/2026-009-01.cad.HUB75-display-frame             -e GITHUB_SHA="$BENCH_SOURCE_SHA"             -e SCAD_PROJECT_SOURCE_SHA="$BENCH_SOURCE_SHA"             -e SCAD_PROJECT_TOOL_SHA="$SCAD_PROJECT_TOOL_SHA"             -e SCAD_PROJECT_WORKFLOW_VERSION="$SCAD_PROJECT_WORKFLOW_VERSION"             -e SCAD_TOOLCHAIN_IMAGE="$RUNTIME_IMAGE"             -e SCAD_TOOLCHAIN_VERSION="$SCAD_TOOLCHAIN_VERSION"             -e PYTHONDONTWRITEBYTECODE=1             -e MOON_INSTALL_ROOT=/moon-runtime             -e MATERIALIZATION_CAPABILITIES="$MATERIALIZATION_CAPABILITIES"             -v "$GITHUB_WORKSPACE:/work"             -v "$moon_runtime:/moon-runtime"             -w /work             "$RUNTIME_IMAGE" bash -lc '
               set -euo pipefail
               git config --global --add safe.directory /work
               bash ./bootstrap.sh
@@ -249,8 +259,9 @@ jobs:
               "schema": "brainboxemb.scad-cache-transport.v1",
               "variant": os.environ["VARIANT"],
               "moon_transport": os.environ["MOON_TRANSPORT"] == "true",
-              "hub75_source": os.environ["HUB75_SOURCE_SHA"],
-              "hub75_base": os.environ["HUB75_BASE_SHA"],
+              "hub75_seed": os.environ["HUB75_SEED_SHA"],
+              "hub75_source": os.environ["BENCH_SOURCE_SHA"],
+              "hub75_base": os.environ["BENCH_BASE_SHA"],
               "tool_scad_project_sha": os.environ["SCAD_PROJECT_TOOL_SHA"],
               "tool_git_project_sha": os.environ["TOOL_GIT_PROJECT_SHA"],
               "runtime_image": os.environ["RUNTIME_IMAGE"],
