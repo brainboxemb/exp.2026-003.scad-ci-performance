@@ -1,0 +1,41 @@
+Publication context : pull_request
+Publication kind    : build
+Publication branch  : dev/pr-7/build
+
+Source
+------
+Repository          : brainboxemb/lib.scad.clamps
+Ref type            : pull_request
+Ref                 : feature/pr-7-m004-common-production
+Commit              : bb071329e1d6c764d09f87ecd2cc78d42ac73679
+Triggered by        : unknown
+Workflow run        : unknown
+
+Tooling
+-------
+SCAD toolchain image: ghcr.io/brainboxemb/scad-toolchain:v0.4.1
+SCAD toolchain ver. : v0.4.1
+tool.scad-project   : v0.13.0
+
+Git submodules
+--------------
+tools/tool.git-project : 5db2b23b95ad0a230ab5d5d2bed725927328fcfe
+tools/tool.scad-project : da57820fdadd7d203091b6818984991f1548408f
+
+Runtime components
+------------------
+SCAD toolchain
+==============
+OpenSCAD   : OpenSCAD version 2026.09.09.nightly
+PythonSCAD : PythonSCAD version 1.1.2
+Python     : Python 3.12.3
+Git        : git version 2.43.0
+SCons      : 4.11.1
+BOSL2      : v2.0.752
+pybosl2    : 0.6.7
+Shapely    : 2.1.2
+docsgen    : 2.0.55
+Pillow     : 12.3.0
+OPENSCADPATH: /opt/openscad-libraries
+BOSL2_ROOT  : /opt/openscad-libraries/BOSL2
+PYTHONPATH : /work/tools/tool.scad-project/src:/opt/python-libs
