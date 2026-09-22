@@ -43,3 +43,10 @@ Run multiple repetitions before drawing a conclusion. Warm and cold host-cache b
 If cached-host OpenSCAD is materially better, a second experiment round must reproduce the full current production-toolchain surface (PythonSCAD, BOSL2, pybosl2, Shapely, docsgen, SCons and Pillow) before Migration 004 changes execution strategy.
 
 This repository is experimental evidence only. Production tooling changes belong in their owning repositories after the experiment reaches a documented conclusion.
+
+
+## Round 2 — cache transport
+
+The follow-up cache-transport experiment is tracked in
+[issue #2](https://github.com/brainboxemb/exp.2026-003.scad-ci-performance/issues/2)
+and documented in [results/cache-transport.md](results/cache-transport.md).
