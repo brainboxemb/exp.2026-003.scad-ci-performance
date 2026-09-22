@@ -120,8 +120,8 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           test "$status" -eq 0
-          warning_count="$(grep -c 'A full Git history is required for affected checks' evidence/console.log || true)"
-          printf '{"variant":"%s","warning_count":%s,"shallow":"%s","explicit_range":"%s"}\n'             '${{ matrix.variant }}' "$warning_count" '${{ matrix.full_history }}' '${{ matrix.explicit_range }}'             > evidence/result.json
+          warning_count="$(grep -Ec 'A full Git history is required for affected checks|Detected a shallow checkout while comparing against an explicit base' evidence/console.log || true)"
+          printf '{"variant":"%s","warning_count":%s,"full_history":"%s","explicit_range":"%s"}\n'             '${{ matrix.variant }}' "$warning_count" '${{ matrix.full_history }}' '${{ matrix.explicit_range }}'             > evidence/result.json
           cat evidence/result.json
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
