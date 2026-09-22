@@ -1,7 +1,6 @@
 name: Clamps lifecycle topology benchmark v2
 
 on:
-  pull_request:
   workflow_dispatch:
 
 concurrency:

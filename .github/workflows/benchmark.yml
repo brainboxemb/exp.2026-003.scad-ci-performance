@@ -1,7 +1,6 @@
 name: SCAD CI execution benchmark
 
 on:
-  pull_request:
   workflow_dispatch:
 
 concurrency:
