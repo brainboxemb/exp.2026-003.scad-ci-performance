@@ -1,0 +1,287 @@
+name: SCAD cache transport benchmark
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cache-transport.yml'
+      - 'results/cache-transport.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  HUB75_SOURCE_SHA: 660b04129bb127d13eaf59dca3c51ffeb8251572
+  HUB75_BASE_SHA: f571179432574002a5ab4e4f85a3fb0af2a9fdcd
+  TOOL_GIT_PROJECT_SHA: 9879da589101f41b2b0e634d196ddcc51e1a6102
+  SCAD_TOOLCHAIN_VERSION: v0.6.1
+  SCAD_PROJECT_WORKFLOW_VERSION: v0.15.2
+
+jobs:
+  benchmark:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline-moon-plus-scons
+            moon_transport: 'true'
+          - variant: scons-only-transport
+            moon_transport: 'false'
+
+    steps:
+      - name: Start benchmark timer
+        shell: bash
+        run: echo "BENCHMARK_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Checkout fixed HUB75 source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: brainboxemb/2026-009-01.cad.HUB75-display-frame
+          ref: ${{ env.HUB75_SOURCE_SHA }}
+          fetch-depth: 1
+          filter: blob:none
+          submodules: false
+          persist-credentials: false
+
+      - name: Fetch exact comparison base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$HUB75_BASE_SHA"
+          git rev-parse --verify "${HUB75_BASE_SHA}^{commit}"
+
+      - name: Initialize pinned SCAD task policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 -- tools/tool.scad-project
+          test "$(git -C tools/tool.scad-project rev-parse HEAD)" = "70fd4162731484a949dc390e942dde8b8d811f10"
+          echo "SCAD_PROJECT_TOOL_SHA=$(git -C tools/tool.scad-project rev-parse HEAD)" >> "$GITHUB_ENV"
+          bash tools/tool.scad-project/scripts/fetch_base_gitlink_commit.sh             "$HUB75_BASE_SHA"             tools/tool.scad-project
+
+      - name: Query exact affected capabilities
+        id: affected
+        uses: brainboxemb/tool.git-project/moon/affected@9879da589101f41b2b0e634d196ddcc51e1a6102
+        with:
+          task: consumer:scad.docs
+          base: ${{ env.HUB75_BASE_SHA }}
+          head: ${{ env.HUB75_SOURCE_SHA }}
+          evidence-directory: .moon/preflight
+
+      - name: Set up host Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build exact SCAD execution plan
+        shell: bash
+        env:
+          AFFECTED_TASKS: ${{ steps.affected.outputs.affected-tasks }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -e ./tools/tool.scad-project
+          scad-project tooling-check
+          python -m scad_project.ci_policy             --affected-tasks .moon/preflight/affected-task-ids.json             --decision .moon/preflight/decision.json             > .moon/preflight/scad-ci-plan.json
+          cat .moon/preflight/scad-ci-plan.json
+          echo "RUNTIME_IMAGE=$(jq -r '.runtime_image' .moon/preflight/scad-ci-plan.json)" >> "$GITHUB_ENV"
+          echo "MATERIALIZATION_CAPABILITIES=$(jq -r '.materialization_capabilities | join(" ")' .moon/preflight/scad-ci-plan.json)" >> "$GITHUB_ENV"
+          test "$(jq -r '.build_engine' .moon/preflight/scad-ci-plan.json)" = scons
+          test "$(jq -r '.use_scons_cache' .moon/preflight/scad-ci-plan.json)" = true
+          test "$(jq -r '.use_verification_scons_cache' .moon/preflight/scad-ci-plan.json)" = true
+
+      - name: Start cache restore timer
+        shell: bash
+        run: echo "CACHE_RESTORE_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Restore portable Moon output cache
+        if: matrix.moon_transport == 'true'
+        id: moon-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .moon/cache/hashes
+            .moon/cache/outputs
+          key: exp89-${{ matrix.variant }}-moon-v1-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            exp89-${{ matrix.variant }}-moon-v1-${{ runner.os }}-
+
+      - name: Restore normal SCons cache
+        id: build-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .cache/scad-project/scons
+          key: exp89-${{ matrix.variant }}-build-scons-v1-${{ runner.os }}-${{ env.SCAD_PROJECT_TOOL_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            exp89-${{ matrix.variant }}-build-scons-v1-${{ runner.os }}-${{ env.SCAD_PROJECT_TOOL_SHA }}-
+
+      - name: Restore verification SCons cache
+        id: verification-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .cache/scad-project/verification-scons
+          key: exp89-${{ matrix.variant }}-verification-scons-v1-${{ runner.os }}-${{ env.SCAD_PROJECT_TOOL_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            exp89-${{ matrix.variant }}-verification-scons-v1-${{ runner.os }}-${{ env.SCAD_PROJECT_TOOL_SHA }}-
+
+      - name: Finish cache restore timer
+        shell: bash
+        run: |
+          echo "CACHE_RESTORE_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          du -sb .moon/cache/hashes .moon/cache/outputs .cache/scad-project/scons .cache/scad-project/verification-scons 2>/dev/null || true
+
+      - name: Pull exact runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "RUNTIME_PULL_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$RUNTIME_IMAGE"
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          echo "RUNTIME_PULL_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Materialize SCAD capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "MATERIALIZATION_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+          moon_runtime="$RUNNER_TEMP/tool-git-project/moon-runtime"
+          test -d "$moon_runtime"
+
+          docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp             -e CI=true             -e GITHUB_ACTIONS=true             -e GITHUB_WORKSPACE=/work             -e GITHUB_REPOSITORY=brainboxemb/2026-009-01.cad.HUB75-display-frame             -e GITHUB_SHA="$HUB75_SOURCE_SHA"             -e SCAD_PROJECT_SOURCE_SHA="$HUB75_SOURCE_SHA"             -e SCAD_PROJECT_TOOL_SHA="$SCAD_PROJECT_TOOL_SHA"             -e SCAD_PROJECT_WORKFLOW_VERSION="$SCAD_PROJECT_WORKFLOW_VERSION"             -e SCAD_TOOLCHAIN_IMAGE="$RUNTIME_IMAGE"             -e SCAD_TOOLCHAIN_VERSION="$SCAD_TOOLCHAIN_VERSION"             -e PYTHONDONTWRITEBYTECODE=1             -e MOON_INSTALL_ROOT=/moon-runtime             -e MATERIALIZATION_CAPABILITIES="$MATERIALIZATION_CAPABILITIES"             -v "$GITHUB_WORKSPACE:/work"             -v "$moon_runtime:/moon-runtime"             -w /work             "$RUNTIME_IMAGE" bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /work
+              bash ./bootstrap.sh
+              git config --global --add safe.directory /work/tools/tool.git-project
+              git config --global --add safe.directory /work/tools/tool.scad-project
+              bash ./tools/tool.scad-project/scad-project.sh tooling-check
+              scad-toolchain-info
+              for capability in $MATERIALIZATION_CAPABILITIES; do
+                echo "Moon materialization: consumer:$capability"
+                bash ./tools/tool.git-project/moon-project.sh run                   "consumer:$capability"                   --repo .                   --install-root /moon-runtime
+              done
+            '
+
+          echo "MATERIALIZATION_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Start cache save timer
+        shell: bash
+        run: echo "CACHE_SAVE_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Save normal SCons cache
+        if: hashFiles('.cache/scad-project/scons/**') != ''
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .cache/scad-project/scons
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
+      - name: Save verification SCons cache
+        if: hashFiles('.cache/scad-project/verification-scons/**') != ''
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .cache/scad-project/verification-scons
+          key: ${{ steps.verification-cache.outputs.cache-primary-key }}
+
+      - name: Save portable Moon output cache
+        if: matrix.moon_transport == 'true' && hashFiles('.moon/cache/**') != ''
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .moon/cache/hashes
+            .moon/cache/outputs
+          key: ${{ steps.moon-cache.outputs.cache-primary-key }}
+
+      - name: Record benchmark evidence
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+          MOON_TRANSPORT: ${{ matrix.moon_transport }}
+          MOON_CACHE_HIT: ${{ steps.moon-cache.outputs.cache-hit }}
+          BUILD_CACHE_HIT: ${{ steps.build-cache.outputs.cache-hit }}
+          VERIFICATION_CACHE_HIT: ${{ steps.verification-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          echo "CACHE_SAVE_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          end_ns="$(date +%s%N)"
+          mkdir -p benchmark-evidence/reports benchmark-evidence/manifests
+
+          cp .moon/preflight/decision.json benchmark-evidence/
+          cp .moon/preflight/affected-task-ids.json benchmark-evidence/
+          cp .moon/preflight/scad-ci-plan.json benchmark-evidence/
+
+          for report in             .cache/scad-project/state/last-build.json             .cache/scad-project/state/last-design-build.json             .cache/scad-project/verification-state/last-verification-build.json; do
+            if [[ -s "$report" ]]; then
+              cp "$report" benchmark-evidence/reports/
+            fi
+          done
+
+          {
+            find bld/png bld/svg bld/stl bld/drawing vrf/out               -type f               ! -path '*/evidence/*'               ! -name 'publication-info.txt'               -print0 2>/dev/null             | sort -z             | xargs -0 -r sha256sum
+          } > benchmark-evidence/manifests/generated.sha256
+
+          BENCHMARK_END_NS="$end_ns" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def ns_ms(start, end):
+              return round((int(os.environ[end]) - int(os.environ[start])) / 1_000_000, 3)
+
+          def size(path):
+              p = Path(path)
+              if not p.exists():
+                  return 0
+              return sum(x.stat().st_size for x in p.rglob("*") if x.is_file())
+
+          data = {
+              "schema": "brainboxemb.scad-cache-transport.v1",
+              "variant": os.environ["VARIANT"],
+              "moon_transport": os.environ["MOON_TRANSPORT"] == "true",
+              "hub75_source": os.environ["HUB75_SOURCE_SHA"],
+              "hub75_base": os.environ["HUB75_BASE_SHA"],
+              "tool_scad_project_sha": os.environ["SCAD_PROJECT_TOOL_SHA"],
+              "tool_git_project_sha": os.environ["TOOL_GIT_PROJECT_SHA"],
+              "runtime_image": os.environ["RUNTIME_IMAGE"],
+              "cache_hit": {
+                  "moon": os.environ.get("MOON_CACHE_HIT", ""),
+                  "build_scons": os.environ.get("BUILD_CACHE_HIT", ""),
+                  "verification_scons": os.environ.get("VERIFICATION_CACHE_HIT", ""),
+              },
+              "cache_bytes_after_run": {
+                  "moon_hashes": size(".moon/cache/hashes"),
+                  "moon_outputs": size(".moon/cache/outputs"),
+                  "build_scons": size(".cache/scad-project/scons"),
+                  "verification_scons": size(".cache/scad-project/verification-scons"),
+              },
+              "timing_ms": {
+                  "cache_restore": ns_ms("CACHE_RESTORE_START_NS", "CACHE_RESTORE_END_NS"),
+                  "runtime_pull": ns_ms("RUNTIME_PULL_START_NS", "RUNTIME_PULL_END_NS"),
+                  "materialization": ns_ms("MATERIALIZATION_START_NS", "MATERIALIZATION_END_NS"),
+                  "cache_save": ns_ms("CACHE_SAVE_START_NS", "CACHE_SAVE_END_NS"),
+                  "total": round((int(os.environ["BENCHMARK_END_NS"]) - int(os.environ["BENCHMARK_START_NS"])) / 1_000_000, 3),
+              },
+              "github": {
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              },
+          }
+          Path("benchmark-evidence/metrics.json").write_text(
+              json.dumps(data, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(data, indent=2))
+          PY
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cache-transport-${{ matrix.variant }}
+          path: benchmark-evidence
+          if-no-files-found: error
+          retention-days: 14
